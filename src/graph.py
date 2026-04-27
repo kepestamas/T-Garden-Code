@@ -2,6 +2,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from mpl_toolkits.basemap import Basemap
 import requests
+from pygeodesy.sphericalNvector import LatLon, intersection
 from pyproj import Geod
 
 
@@ -574,16 +575,120 @@ class Graph:
                 self.__draw_edge_on_geo(closest_edge, color = "yellow")
                 self.drawing_selected_edge = closest_edge
 
-    def __distance_between_point_and_edge(self, lon, lat, edge):
-        lons, lats = self.edge_to_geo_proj(edge)
-        min_dist = 1000
+    def __distance_between_point_and_edge(self, lon, lat, edge, granularity = 100):
+        lons, lats = self.edge_to_geo_proj(edge, granularity=granularity)
+        min_dist = 100000
         for i in range(len(lons)):
             _, _, distance = self.geod.inv(lon, lat, lons[i], lats[i])
             distance /= 1000
             if distance < min_dist:
                 min_dist = distance
         return min_dist
+    
+    def check_spherical_crossing(self,p1, p2, p3, p4):
+        """
+        p1, p2, p3, p4 are (lat, lon) tuples.
+        Returns True if arc p1-p2 and arc p3-p4 intersect.
+        """
+        # 1. Initialize LatLon objects
+        A, B = LatLon(*p1), LatLon(*p2)
+        C, D = LatLon(*p3), LatLon(*p4)
+
+        try:
+            # 2. Find the intersection point of the two GREAT CIRCLES 
+            # (Note: This finds where the lines would cross if they went around the whole earth)
+            pos = intersection(A, B, C, D)
+            
+            if pos is None:
+                return False
+
+            # 3. Verify the intersection point lies ON both segments
+            # We check if the point is between the endpoints of both arcs
+            if pos.iswithin(A, B) and pos.iswithin(C, D):
                 
+                # 4. Optional: Ignore shared vertices (nodes)
+                # If the "crossing" is just a shared endpoint, it's not a true crossing
+                for endpoint in [A, B, C, D]:
+                    if pos.equals(endpoint, eps=1e-6): # Using a small epsilon for float precision
+                        return False
+                
+                return True
+                
+        except ValueError:
+            # Occurs if lines are parallel or points are antipodal
+            return False
+
+        return False
+    
+    def check_one_edge_crossing(self, edge, edge2):
+        if (edge != edge2):
+            p1 = (self.G.nodes[edge[0]]["Latitude"], self.G.nodes[edge[0]]["Longitude"])
+            p2 = (self.G.nodes[edge[1]]["Latitude"], self.G.nodes[edge[1]]["Longitude"])
+            p3 = (self.G.nodes[edge2[0]]["Latitude"], self.G.nodes[edge2[0]]["Longitude"])
+            p4 = (self.G.nodes[edge2[1]]["Latitude"], self.G.nodes[edge2[1]]["Longitude"])
+            
+            if (self.check_spherical_crossing(p1, p2, p3, p4)):
+                print(f"E1: {edge} E2: {edge2}")
+                return True
+        return False
+
+    def check_all_edge_crossings(self):
+        edges = list(self.G.edges)
+        count = 0
+        for i in range(len(edges) - 1):
+            edge = edges[i]
+            # print(edge)
+            # print(self.edge_length_in_km(edge))
+            for j in range(i+1, len(edges)):
+                edge2 = edges[j]
+                if (edge != edge2):
+                    p1 = (self.G.nodes[edge[0]]["Latitude"], self.G.nodes[edge[0]]["Longitude"])
+                    p2 = (self.G.nodes[edge[1]]["Latitude"], self.G.nodes[edge[1]]["Longitude"])
+                    p3 = (self.G.nodes[edge2[0]]["Latitude"], self.G.nodes[edge2[0]]["Longitude"])
+                    p4 = (self.G.nodes[edge2[1]]["Latitude"], self.G.nodes[edge2[1]]["Longitude"])
+                    
+                    if (self.check_spherical_crossing(p1, p2, p3, p4)):
+                        print(f"E1: {edge} E2: {edge2}")
+                        count += 1
+        # print(count)
+        return count
+
+
+    def fix_edges_too_close_to_nodes(self):
+        problematic_edges_and_substitutions = []
+        alpha = 5
+        
+        for edge in self.G.edges:
+            # print(edge)
+            # print(self.edge_length_in_km(edge))
+            for node in self.G.nodes:
+                if node != edge[0] and node != edge[1]:
+                    distance = self.__distance_between_point_and_edge(self.G.nodes[node]["Longitude"], self.G.nodes[node]["Latitude"], edge)
+                    if distance < alpha:
+                        # print(f"Node {node} Edge {edge} Dist {distance}")
+                        for edge2 in self.G.edges:
+                            if (self.check_one_edge_crossing(edge, edge2)):
+                                edge_with_substitution = {}
+                                edge_with_substitution["e"] = edge
+                                edge_with_substitution["e1"] = (edge[0], node)
+                                edge_with_substitution["e2"] = (node, edge[1])
+                                problematic_edges_and_substitutions.append(edge_with_substitution)
+        count = 0
+        for edge_with_substitution in problematic_edges_and_substitutions:
+            if edge_with_substitution["e"] in self.G.edges:
+                count += 1
+                id = self.G.edges[edge]["id"]
+                self.G.remove_edge(edge_with_substitution["e"][0], edge_with_substitution["e"][1])
+                if (edge_with_substitution["e1"][0], edge_with_substitution["e1"][1]) not in self.G.edges:
+                    self.G.add_edge(edge_with_substitution["e1"][0], edge_with_substitution["e1"][1])
+                if (edge_with_substitution["e2"][0], edge_with_substitution["e2"][1]) not in self.G.edges:
+                    self.G.add_edge(edge_with_substitution["e2"][0], edge_with_substitution["e2"][1])
+                # nx.set_edge_attributes(G, {(edge_with_substitution["e1"][0], edge_with_substitution["e1"][1]) : {"id": str(id) + "_1"}})
+                # nx.set_edge_attributes(G, {(edge_with_substitution["e2"][0], edge_with_substitution["e2"][1]) : {"id": str(id) + "_2"}})
+        
+        print(f"Fixed {count} edges")
+
+
     def __draw_node(self, node, color="red", refresh=True):
         lat = node["Latitude"]
         lon = node["Longitude"]
@@ -596,3 +701,11 @@ class Graph:
         if refresh:
             plt.figure(1).canvas.draw()
 
+
+# G = Graph("unified", "East Asia_200_500_mst.gml")
+# # G.draw_on_map_plot()
+# # G.check_all_edge_crossings()
+# # G.fix_edges_too_close_to_nodes()
+# # G.check_all_edge_crossings()
+# # G.serialize_to_gml()
+# G.draw_on_map_plot()
